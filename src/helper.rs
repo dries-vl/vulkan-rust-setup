@@ -1,11 +1,15 @@
+use crate::win;
+use ash::util::*;
+use ash::util::{read_spv, Align};
+use ash::vk::{DeviceMemory, Extent2D, Framebuffer, Image, ImageView, PhysicalDevice, PhysicalDeviceMemoryProperties, PipelineLayout, PipelineViewportStateCreateInfo, Rect2D, RenderPass, StructureType, SurfaceFormatKHR, SurfaceKHR, SwapchainKHR, Viewport};
+use ash::{ext::debug_utils, khr, khr::win32_surface, khr::{surface, swapchain}, vk, Device, Entry, Instance};
+use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
+use std::io::Cursor;
+use std::mem;
+use std::mem::{align_of, size_of, size_of_val};
 use std::{
     borrow::Cow, cell::RefCell, default::Default, error::Error, ffi, ops::Drop, os::raw::c_char,
 };
-
-use crate::win;
-use ash::vk::{DeviceMemory, Extent2D, Framebuffer, Image, ImageView, PhysicalDevice, PhysicalDeviceMemoryProperties, PipelineViewportStateCreateInfo, Rect2D, RenderPass, StructureType, SurfaceFormatKHR, SurfaceKHR, SwapchainKHR, Viewport};
-use ash::{ext::debug_utils, khr, khr::win32_surface, khr::{surface, swapchain}, vk, Device, Entry, Instance};
-use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_QUIT};
@@ -251,9 +255,24 @@ pub struct Target<'a> {
     pub viewport_state_info: PipelineViewportStateCreateInfo<'a>
 }
 
+// todo: separate further into separate files and add specific functions
+// todo: that make it easier to add things without restructuring code
+// todo: after first making creation of (Base, Target, Sync, Process) clear oneliners
+// todo: and then looking to see what is needed afterwards to run things
+// todo: and then add functions to add stuff to it easily in main, ex. shaders, vertex models, etc.
+
 // todo: add a third struct for Process, that contains all pipeline, shaders stuff
-// todo: goal is to be able to add a lot of new shaders and vertex models on the fly
-// todo: without having to change anything structurally
+pub struct Process {
+    pub pipeline_layout: PipelineLayout,
+    pub pipelines: Vec<vk::Pipeline>,
+    pub vertex_buffer: vk::Buffer,
+    pub vertex_buffer_memory: vk::DeviceMemory,
+    pub index_buffer: vk::Buffer,
+    pub index_buffer_memory: vk::DeviceMemory,
+    pub index_buffer_data: [u32; 3],
+    pub vertex_shader_module: vk::ShaderModule,
+    pub fragment_shader_module: vk::ShaderModule,
+}
 
 pub struct Sync {
     pub queue_family_index: u32,
@@ -907,5 +926,274 @@ fn vk_drop(base: &mut Base, target: &mut Target, sync: &mut Sync) {
         base.debug_utils_loader
             .destroy_debug_utils_messenger(base.debug_call_back, None);
         base.instance.destroy_instance(None);
+    }
+}
+
+#[derive(Clone, Debug, Copy)]
+struct Vertex {
+    pos: [f32; 4],
+    color: [f32; 4],
+}
+
+pub unsafe fn vk_create_process(base: &Base, target: &Target) -> Process {
+    let index_buffer_data = [0u32, 1, 2];
+    let index_buffer_info = vk::BufferCreateInfo::default()
+        .size(size_of_val(&index_buffer_data) as u64)
+        .usage(vk::BufferUsageFlags::INDEX_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+    let index_buffer = base.device.create_buffer(&index_buffer_info, None).unwrap();
+    let index_buffer_memory_req = base.device.get_buffer_memory_requirements(index_buffer);
+    let index_buffer_memory_index = find_memorytype_index(
+        &index_buffer_memory_req,
+        &base.device_memory_properties,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )
+        .expect("Unable to find suitable memorytype for the index buffer.");
+
+    let index_allocate_info = vk::MemoryAllocateInfo {
+        allocation_size: index_buffer_memory_req.size,
+        memory_type_index: index_buffer_memory_index,
+        ..Default::default()
+    };
+    let index_buffer_memory = base
+        .device
+        .allocate_memory(&index_allocate_info, None)
+        .unwrap();
+    let index_ptr = base
+        .device
+        .map_memory(
+            index_buffer_memory,
+            0,
+            index_buffer_memory_req.size,
+            vk::MemoryMapFlags::empty(),
+        )
+        .unwrap();
+    let mut index_slice = Align::new(
+        index_ptr,
+        align_of::<u32>() as u64,
+        index_buffer_memory_req.size,
+    );
+    index_slice.copy_from_slice(&index_buffer_data);
+    base.device.unmap_memory(index_buffer_memory);
+    base.device
+        .bind_buffer_memory(index_buffer, index_buffer_memory, 0)
+        .unwrap();
+
+    let vertex_buffer_info = vk::BufferCreateInfo {
+        size: 3 * size_of::<Vertex>() as u64,
+        usage: vk::BufferUsageFlags::VERTEX_BUFFER,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        ..Default::default()
+    };
+
+    let vertex_buffer = base
+        .device
+        .create_buffer(&vertex_buffer_info, None)
+        .unwrap();
+
+    let vertex_buffer_memory_req = base
+        .device
+        .get_buffer_memory_requirements(vertex_buffer);
+
+    let vertex_buffer_memory_index = find_memorytype_index(
+        &vertex_buffer_memory_req,
+        &base.device_memory_properties,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )
+        .expect("Unable to find suitable memorytype for the vertex buffer.");
+
+    let vertex_buffer_allocate_info = vk::MemoryAllocateInfo {
+        allocation_size: vertex_buffer_memory_req.size,
+        memory_type_index: vertex_buffer_memory_index,
+        ..Default::default()
+    };
+
+    let vertex_buffer_memory = base
+        .device
+        .allocate_memory(&vertex_buffer_allocate_info, None)
+        .unwrap();
+
+    let vertices = [
+        Vertex {
+            pos: [-1.0, 1.0, 0.0, 1.0],
+            color: [0.0, 1.0, 0.0, 1.0],
+        },
+        Vertex {
+            pos: [1.0, 1.0, 0.0, 1.0],
+            color: [0.0, 0.0, 1.0, 1.0],
+        },
+        Vertex {
+            pos: [0.0, -1.0, 0.0, 1.0],
+            color: [1.0, 0.0, 0.0, 1.0],
+        },
+    ];
+
+    let vert_ptr = base
+        .device
+        .map_memory(
+            vertex_buffer_memory,
+            0,
+            vertex_buffer_memory_req.size,
+            vk::MemoryMapFlags::empty(),
+        )
+        .unwrap();
+
+    let mut vert_align = Align::new(
+        vert_ptr,
+        align_of::<Vertex>() as u64,
+        vertex_buffer_memory_req.size,
+    );
+    vert_align.copy_from_slice(&vertices);
+    base.device.unmap_memory(vertex_buffer_memory);
+    base.device
+        .bind_buffer_memory(vertex_buffer, vertex_buffer_memory, 0)
+        .unwrap();
+    let mut vertex_spv_file =
+        Cursor::new(&include_bytes!("../shader/vert.spv")[..]);
+    let mut frag_spv_file = Cursor::new(&include_bytes!("../shader/frag.spv")[..]);
+
+    let vertex_code =
+        read_spv(&mut vertex_spv_file).expect("Failed to read vertex shader spv file");
+    let vertex_shader_info = vk::ShaderModuleCreateInfo::default().code(&vertex_code);
+
+    let frag_code =
+        read_spv(&mut frag_spv_file).expect("Failed to read fragment shader spv file");
+    let frag_shader_info = vk::ShaderModuleCreateInfo::default().code(&frag_code);
+
+    let vertex_shader_module = base
+        .device
+        .create_shader_module(&vertex_shader_info, None)
+        .expect("Vertex shader module error");
+
+    let fragment_shader_module = base
+        .device
+        .create_shader_module(&frag_shader_info, None)
+        .expect("Fragment shader module error");
+
+    let layout_create_info = vk::PipelineLayoutCreateInfo::default();
+
+    let pipeline_layout = base
+        .device
+        .create_pipeline_layout(&layout_create_info, None)
+        .unwrap();
+
+    let shader_entry_name = ffi::CStr::from_bytes_with_nul_unchecked(b"main\0");
+    let shader_stage_create_infos = [
+        vk::PipelineShaderStageCreateInfo {
+            module: vertex_shader_module,
+            p_name: shader_entry_name.as_ptr(),
+            stage: vk::ShaderStageFlags::VERTEX,
+            ..Default::default()
+        },
+        vk::PipelineShaderStageCreateInfo {
+            s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+            module: fragment_shader_module,
+            p_name: shader_entry_name.as_ptr(),
+            stage: vk::ShaderStageFlags::FRAGMENT,
+            ..Default::default()
+        },
+    ];
+    let vertex_input_binding_descriptions = [vk::VertexInputBindingDescription {
+        binding: 0,
+        stride: size_of::<Vertex>() as u32,
+        input_rate: vk::VertexInputRate::VERTEX,
+    }];
+    let vertex_input_attribute_descriptions = [
+        vk::VertexInputAttributeDescription {
+            location: 0,
+            binding: 0,
+            format: vk::Format::R32G32B32A32_SFLOAT,
+            offset: offset_of!(Vertex, pos) as u32,
+        },
+        vk::VertexInputAttributeDescription {
+            location: 1,
+            binding: 0,
+            format: vk::Format::R32G32B32A32_SFLOAT,
+            offset: offset_of!(Vertex, color) as u32,
+        },
+    ];
+
+    let vertex_input_state_info = vk::PipelineVertexInputStateCreateInfo::default()
+        .vertex_attribute_descriptions(&vertex_input_attribute_descriptions)
+        .vertex_binding_descriptions(&vertex_input_binding_descriptions);
+    let vertex_input_assembly_state_info = vk::PipelineInputAssemblyStateCreateInfo {
+        topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+        ..Default::default()
+    };
+
+    let rasterization_info = vk::PipelineRasterizationStateCreateInfo {
+        front_face: vk::FrontFace::COUNTER_CLOCKWISE,
+        line_width: 1.0,
+        polygon_mode: vk::PolygonMode::FILL,
+        ..Default::default()
+    };
+    let multisample_state_info = vk::PipelineMultisampleStateCreateInfo {
+        rasterization_samples: vk::SampleCountFlags::TYPE_1,
+        ..Default::default()
+    };
+    let noop_stencil_state = vk::StencilOpState {
+        fail_op: vk::StencilOp::KEEP,
+        pass_op: vk::StencilOp::KEEP,
+        depth_fail_op: vk::StencilOp::KEEP,
+        compare_op: vk::CompareOp::ALWAYS,
+        ..Default::default()
+    };
+    let depth_state_info = vk::PipelineDepthStencilStateCreateInfo {
+        depth_test_enable: 1,
+        depth_write_enable: 1,
+        depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
+        front: noop_stencil_state,
+        back: noop_stencil_state,
+        max_depth_bounds: 1.0,
+        ..Default::default()
+    };
+    let color_blend_attachment_states = [vk::PipelineColorBlendAttachmentState {
+        blend_enable: 0,
+        src_color_blend_factor: vk::BlendFactor::SRC_COLOR,
+        dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_DST_COLOR,
+        color_blend_op: vk::BlendOp::ADD,
+        src_alpha_blend_factor: vk::BlendFactor::ZERO,
+        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+        alpha_blend_op: vk::BlendOp::ADD,
+        color_write_mask: vk::ColorComponentFlags::RGBA,
+    }];
+    let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
+        .logic_op(vk::LogicOp::CLEAR)
+        .attachments(&color_blend_attachment_states);
+
+    let dynamic_state = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state_info =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_state);
+
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+        .stages(&shader_stage_create_infos)
+        .vertex_input_state(&vertex_input_state_info)
+        .input_assembly_state(&vertex_input_assembly_state_info)
+        .rasterization_state(&rasterization_info)
+        .multisample_state(&multisample_state_info)
+        .depth_stencil_state(&depth_state_info)
+        .color_blend_state(&color_blend_state)
+        .layout(pipeline_layout)
+        // dependency on TARGET
+        .render_pass(target.renderpass)
+        .viewport_state(&target.viewport_state_info)
+        .dynamic_state(&dynamic_state_info);
+
+    let pipelines = base
+        .device
+        .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+        .expect("Unable to create pipeline");
+
+    Process {
+        pipeline_layout,
+        pipelines,
+        vertex_buffer,
+        vertex_buffer_memory,
+        index_buffer,
+        index_buffer_memory,
+        index_buffer_data,
+        vertex_shader_module,
+        fragment_shader_module
     }
 }

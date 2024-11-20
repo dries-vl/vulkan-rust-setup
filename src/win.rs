@@ -17,7 +17,7 @@ use windows_sys::Win32::{
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::*,
 };
-use windows_sys::Win32::UI::Input::{GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTHEADER, RID_INPUT, RIM_TYPEMOUSE};
+use windows_sys::Win32::UI::Input::{GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT, RIM_TYPEMOUSE};
 
 /// Struct that takes a windows HWND and implements DisplayHandle and WindowHandle,
 /// to be able to use it as window for graphics apis
@@ -99,6 +99,27 @@ pub unsafe fn get_hwnd(width: i32, height: i32) -> HWND {
         128,  // Alpha
         LWA_ALPHA,
     );
+
+    // register for raw input events
+    unsafe {
+        let raw_input_device = RAWINPUTDEVICE {
+            usUsagePage: 0x01,  // HID_USAGE_PAGE_GENERIC
+            usUsage: 0x02,      // HID_USAGE_GENERIC_MOUSE
+            dwFlags: 0,         // No flags
+            hwndTarget: hwnd,   // Your window handle
+        };
+        // todo: add keyboard to raw input
+
+        if RegisterRawInputDevices(
+            &raw_input_device,
+            1,
+            std::mem::size_of::<RAWINPUTDEVICE>() as u32
+        ) == 0 {
+            // Handle error
+            println!("Failed to register raw input device");
+        }
+    }
+    
     hwnd
 }
 
@@ -176,6 +197,10 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+
+    let process_ptr = GetWindowLongPtrA(hwnd, GWLP_USERDATA) as *mut crate::helper::Process;
+    let mut camera = &mut (*process_ptr).camera;
+
     match msg {
         WM_DESTROY => {
             PostQuitMessage(0);
@@ -212,15 +237,17 @@ unsafe extern "system" fn wnd_proc(
                         let dx = mouse.lLastX;
                         let dy = mouse.lLastY;
 
+                        // make sure that only when left mouse button is currently pressed down
                         if GetAsyncKeyState(VK_LBUTTON.into()) & 0x8000u16 as i16 != 0 {
                             let sensitivity = 0.1;
                             camera.rotate(
-                                dx as f32 * sensitivity,
+                                -dx as f32 * sensitivity,
                                 -dy as f32 * sensitivity
                             );
                         }
                     }
                 }
+                0
             }
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -243,26 +270,6 @@ pub fn handle_input(camera: &mut crate::helper::Camera) {
         }
         if GetAsyncKeyState(VK_S.into()) & 0x8000u16 as i16 != 0 {
             camera.move_right(speed);
-        }
-
-        let mut current_pos: POINT = POINT { x: 0, y: 0 };
-        if GetCursorPos(&mut current_pos) != 0 {
-            static mut LAST_POS: Option<(i32, i32)> = None;
-
-            if let Some((last_x, last_y)) = LAST_POS {
-                let dx = current_pos.x - last_x;
-                let dy = current_pos.y - last_y;
-
-                let sensitivity = 0.1;
-                if dx != 0 || dy != 0 {
-                    camera.rotate(
-                        dx as f32 * sensitivity,
-                        -dy as f32 * sensitivity
-                    );
-                }
-            }
-            
-            std::ptr::write(&raw mut LAST_POS, Some((current_pos.x, current_pos.y)));
         }
     }
 }

@@ -22,9 +22,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         SetWindowLongPtrA(
             hwnd,
             GWLP_USERDATA,
-            Box::into_raw(Box::new(process.camera)) as isize
+            (&mut process as *mut helper::Process) as isize // unsafe ptr
         );
-        
+
         // region MAIN LOOP
         let mut current_frame = 0; // which image in swapchain currently
         // todo: turn around, make win module be main() and call this instead of other way round
@@ -33,7 +33,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             win::handle_input(&mut process.camera);
             // win::center_cursor(hwnd);   // Keep cursor centered for continuous rotation
             process.update_uniform_buffer(&base, &target);  // Add this line
-            
+
             let frame = &sync.frame_data[current_frame];
             let command_buffer = frame.command_buffer;
             let present_complete_semaphore = frame.present_complete_semaphore;
